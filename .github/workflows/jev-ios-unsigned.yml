@@ -8,13 +8,19 @@ on:
   workflow_dispatch:
 
 # Public upstream only; no repository token, certificates, or API secrets.
-permissions: {}
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: xcode-27
     timeout-minutes: 30
     steps:
+      - name: Checkout release preparation scripts
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Check Apple toolchain
         shell: bash
         run: |
@@ -27,6 +33,8 @@ jobs:
         run: |
           set -euo pipefail
           git clone --depth 1 --branch master https://github.com/jev-chat/jev-chat-jarvis-ios.git jev
+          git -C jev fetch --depth 1 origin f4b64cc655415091180e4c0573a2a82ca4319212
+          git -C jev checkout --detach f4b64cc655415091180e4c0573a2a82ca4319212
           git -C jev log -1 --format='Upstream source: %H (%cs)'
 
       - name: Install XcodeGen if absent
@@ -45,6 +53,19 @@ jobs:
           set -euo pipefail
           swiftc -o "$RUNNER_TEMP/jevcheck" tools/PromptCheck/main.swift Shared/*.swift
           "$RUNNER_TEMP/jevcheck"
+
+      - name: Prepare release configuration with fake unsigned test identifiers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 release/prepare_jev_release.py \
+            --source jev --team ABCDE12345 \
+            --bundle com.mpd.testwingchat \
+            --group group.com.mpd.testwingchat \
+            --app-profile FAKE_UNSIGNED_APP_PROFILE \
+            --keyboard-profile FAKE_UNSIGNED_KEYBOARD_PROFILE \
+            --build 123
+          # Dummy identifiers and profiles are never used for signing or distribution.
 
       - name: Generate Xcode project
         working-directory: jev
@@ -75,9 +96,13 @@ jobs:
           keyboard="$app/PlugIns/JevKeyboard.appex"
           test -d "$app"
           test -d "$keyboard"
+          test -f "$app/PrivacyInfo.xcprivacy"
+          test -f "$keyboard/PrivacyInfo.xcprivacy"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist")" = 'com.mpd.testwingchat'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$keyboard/Info.plist")" = 'com.mpd.testwingchat.keyboard'
           /usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionAttributes:PrimaryLanguage' "$keyboard/Info.plist"
           /usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionAttributes:RequestsOpenAccess' "$keyboard/Info.plist"
-          echo "✅ Unsigned Jev iOS app and keyboard extension compiled successfully." >> "$GITHUB_STEP_SUMMARY"
+          echo "✅ Unsigned release-modified iOS app, keyboard, and both privacy manifests compiled successfully." >> "$GITHUB_STEP_SUMMARY"
           echo "This is **not** a TestFlight or iPhone-installable build." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Explain build failures
