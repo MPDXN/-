@@ -1,0 +1,87 @@
+name: Jev iOS unsigned build check
+on:
+  push:
+    branches:
+      - ci/jev-ios-unsigned-20261013
+    paths:
+      - ".github/workflows/jev-ios-unsigned.yml"
+  workflow_dispatch:
+
+# Public upstream only; no repository token, certificates, or API secrets.
+permissions: {}
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - name: Check Apple toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          swift --version
+
+      - name: Fetch public Jev iOS source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch master https://github.com/jev-chat/jev-chat-jarvis-ios.git jev
+          git -C jev log -1 --format='Upstream source: %H (%cs)'
+
+      - name: Install XcodeGen if absent
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: Test shared Swift logic
+        working-directory: jev
+        shell: bash
+        run: |
+          set -euo pipefail
+          swiftc -o "$RUNNER_TEMP/jevcheck" tools/PromptCheck/main.swift Shared/*.swift
+          "$RUNNER_TEMP/jevcheck"
+
+      - name: Generate Xcode project
+        working-directory: jev
+        shell: bash
+        run: xcodegen generate
+
+      - name: Build app and keyboard without Apple signing
+        working-directory: jev
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project JevJarvis.xcodeproj \
+            -scheme JevJarvis \
+            -configuration Debug \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/JevDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            -quiet build
+
+      - name: Validate both build products
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/JevDerivedData/Build/Products/Debug-iphoneos/JevJarvis.app"
+          keyboard="$app/PlugIns/JevKeyboard.appex"
+          test -d "$app"
+          test -d "$keyboard"
+          /usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionAttributes:PrimaryLanguage' "$keyboard/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionAttributes:RequestsOpenAccess' "$keyboard/Info.plist"
+          echo "✅ Unsigned Jev iOS app and keyboard extension compiled successfully." >> "$GITHUB_STEP_SUMMARY"
+          echo "This is **not** a TestFlight or iPhone-installable build." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Explain build failures
+        if: failure()
+        shell: bash
+        run: |
+          echo "❌ Build check did not complete. Examine the failed step logs before claiming source compiles." >> "$GITHUB_STEP_SUMMARY"
