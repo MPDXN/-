@@ -1,0 +1,166 @@
+name: WingChat TestFlight signed release
+on:
+  workflow_dispatch:
+
+# Signed publishing requires an explicitly configured, paid Apple team.
+permissions:
+  contents: read
+
+jobs:
+  archive-and-upload:
+    runs-on: xcode-27
+    timeout-minutes: 55
+    environment: apple-testflight
+    env:
+      ZW_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      ZW_APP_BUNDLE_ID: ${{ vars.ZW_APP_BUNDLE_ID }}
+      ZW_APP_GROUP_ID: ${{ vars.ZW_APP_GROUP_ID }}
+      APPLE_P12_B64: ${{ secrets.APPLE_DISTRIBUTION_CERT_P12_B64 }}
+      APPLE_P12_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_CERT_PASSWORD }}
+      APPLE_APP_PROFILE_B64: ${{ secrets.APPLE_APPSTORE_PROFILE_APP_B64 }}
+      APPLE_KEYBOARD_PROFILE_B64: ${{ secrets.APPLE_APPSTORE_PROFILE_KEYBOARD_B64 }}
+      ASC_API_KEY_B64: ${{ secrets.ASC_API_KEY_P8_B64 }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+
+    steps:
+      - name: Checkout release preparation scripts
+        uses: actions/checkout@v4
+
+      - name: Fail safely when Apple signing is unavailable
+        shell: bash
+        run: |
+          set -euo pipefail
+          for key in ZW_TEAM_ID ZW_APP_BUNDLE_ID ZW_APP_GROUP_ID \
+                     APPLE_P12_B64 APPLE_P12_PASSWORD APPLE_APP_PROFILE_B64 \
+                     APPLE_KEYBOARD_PROFILE_B64 ASC_API_KEY_B64 ASC_KEY_ID ASC_ISSUER_ID; do
+            if [[ -z "${!key:-}" ]]; then
+              echo "Missing Apple membership/signing setup: $key" >&2
+              echo "No TestFlight upload attempted." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+          done
+
+      - name: Fetch verified upstream Jev iOS snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch master https://github.com/jev-chat/jev-chat-jarvis-ios.git jev
+          git -C jev fetch --depth 1 origin f4b64cc655415091180e4c0573a2a82ca4319212
+          git -C jev checkout --detach f4b64cc655415091180e4c0573a2a82ca4319212
+
+      - name: Ensure XcodeGen available
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v xcodegen >/dev/null 2>&1; then brew install xcodegen; fi
+
+      - name: Decode credentials on temporary macOS runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/zw-signing" "$HOME/.appstoreconnect/private_keys"
+          python3 - <<'PY'
+          import base64, os, pathlib
+          directory = pathlib.Path(os.environ['RUNNER_TEMP']) / 'zw-signing'
+          for variable, file in [
+              ('APPLE_P12_B64', 'distribution.p12'),
+              ('APPLE_APP_PROFILE_B64', 'app.mobileprovision'),
+              ('APPLE_KEYBOARD_PROFILE_B64', 'keyboard.mobileprovision'),
+          ]:
+              (directory/file).write_bytes(base64.b64decode(os.environ[variable], validate=True))
+          path = pathlib.Path.home()/'.appstoreconnect/private_keys'/('AuthKey_'+os.environ['ASC_KEY_ID']+'.p8')
+          path.write_bytes(base64.b64decode(os.environ['ASC_API_KEY_B64'], validate=True))
+          path.chmod(0o600)
+          PY
+
+      - name: Install certificate and both App Store profiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/zw-signing/build.keychain-db"
+          keychain_password="$(uuidgen)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/zw-signing/distribution.p12" \
+            -k "$keychain" -P "$APPLE_P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -d user -s "$keychain"
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          for label in app keyboard; do
+            profile="$RUNNER_TEMP/zw-signing/$label.mobileprovision"
+            security cms -D -i "$profile" > "$RUNNER_TEMP/zw-signing/$label.plist"
+            uuid=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$RUNNER_TEMP/zw-signing/$label.plist")
+            name=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/zw-signing/$label.plist")
+            cp "$profile" "$HOME/Library/MobileDevice/Provisioning Profiles/$uuid.mobileprovision"
+            case "$label" in
+              app) printf 'ZW_APP_PROFILE_NAME=%s\n' "$name" >> "$GITHUB_ENV" ;;
+              keyboard) printf 'ZW_KEYBOARD_PROFILE_NAME=%s\n' "$name" >> "$GITHUB_ENV" ;;
+            esac
+          done
+
+      - name: Configure independent identifiers and privacy manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 release/prepare_jev_release.py \
+            --source jev --team "$ZW_TEAM_ID" \
+            --bundle "$ZW_APP_BUNDLE_ID" --group "$ZW_APP_GROUP_ID" \
+            --app-profile "$ZW_APP_PROFILE_NAME" \
+            --keyboard-profile "$ZW_KEYBOARD_PROFILE_NAME" \
+            --build "$GITHUB_RUN_NUMBER"
+          (cd jev && xcodegen generate)
+
+      - name: Run shared-logic regression
+        working-directory: jev
+        shell: bash
+        run: |
+          set -euo pipefail
+          swiftc -o "$RUNNER_TEMP/jevcheck" tools/PromptCheck/main.swift Shared/*.swift
+          "$RUNNER_TEMP/jevcheck"
+
+      - name: Archive signed iPhone application and keyboard
+        working-directory: jev
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -project JevJarvis.xcodeproj -scheme JevJarvis \
+            -sdk iphoneos -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/WingChat.xcarchive" \
+            DEVELOPMENT_TEAM="$ZW_TEAM_ID" CODE_SIGN_STYLE=Manual archive
+
+      - name: Export signed IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, pathlib, plistlib
+          directory=pathlib.Path(os.environ['RUNNER_TEMP'])
+          opts={'method':'app-store-connect','destination':'export','signingStyle':'manual',
+                'teamID':os.environ['ZW_TEAM_ID'],
+                'provisioningProfiles':{
+                  os.environ['ZW_APP_BUNDLE_ID']:os.environ['ZW_APP_PROFILE_NAME'],
+                  os.environ['ZW_APP_BUNDLE_ID']+'.keyboard':os.environ['ZW_KEYBOARD_PROFILE_NAME']}}
+          with (directory/'zw-signing/ExportOptions.plist').open('wb') as f:
+              plistlib.dump(opts,f)
+          PY
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/WingChat.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/zw-signing/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/zw-export"
+          ls "$RUNNER_TEMP/zw-export"/*.ipa >/dev/null
+
+      - name: Upload signed build for Apple TestFlight processing
+        shell: bash
+        run: |
+          set -euo pipefail
+          ipa=$(find "$RUNNER_TEMP/zw-export" -maxdepth 1 -name '*.ipa' -print -quit)
+          test -n "$ipa"
+          xcrun altool --upload-app --type ios --file "$ipa" \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+          echo 'Uploaded to Apple processing. A TestFlight invitation does NOT exist yet.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Wait for processing and assign build to an authorized tester group in App Store Connect.' >> "$GITHUB_STEP_SUMMARY"
